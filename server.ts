@@ -4,6 +4,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
 import { chromium, type BrowserServer, type BrowserContext } from "playwright";
+import { WebSocketServer, WebSocket } from "ws";
+import fs from "fs";
+import { EventEmitter } from "events";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,6 +14,113 @@ const __dirname = path.dirname(__filename);
 const db = new Database("profiles.db");
 const activeServers = new Map<number, BrowserServer>();
 const activeContexts = new Map<number, BrowserContext>();
+
+interface SessionInfo {
+  profileId: number;
+  profileName: string;
+  startTime: number;
+  wsEndpoint: string;
+  ip: string;
+  proxyHost: string | null;
+}
+
+const sessions = new Map<number, SessionInfo>();
+const scriptLogs = new EventEmitter();
+
+async function launchProfile(profileId: number) {
+  if (activeServers.has(profileId)) {
+    const wsEndpoint = activeServers.get(profileId)!.wsEndpoint();
+    const context = activeContexts.get(profileId)!;
+    return { wsEndpoint, context };
+  }
+
+  const profile = db.prepare("SELECT * FROM profiles WHERE id = ?").get(profileId) as any;
+  if (!profile) throw new Error("Profile not found");
+
+  const fingerprint = profile.fingerprint ? JSON.parse(profile.fingerprint) : null;
+  const proxy = profile.proxyHost ? {
+    server: `${profile.proxyHost}:${profile.proxyPort}`,
+    username: profile.proxyUsername || undefined,
+    password: profile.proxyPassword || undefined,
+  } : undefined;
+
+  const browserServer = await chromium.launchServer({ 
+    headless: false,
+    proxy
+  });
+  const wsEndpoint = browserServer.wsEndpoint();
+  const browser = await chromium.connect({ wsEndpoint });
+  
+  const context = await browser.newContext({
+    userAgent: fingerprint?.userAgent,
+    viewport: fingerprint ? { width: fingerprint.screenWidth, height: fingerprint.screenHeight } : undefined,
+    timezoneId: fingerprint?.timezone,
+    locale: fingerprint?.languages?.[0],
+  });
+
+  if (profile.cookies) {
+    try {
+      const cookies = JSON.parse(profile.cookies);
+      await context.addCookies(cookies);
+    } catch (e) {
+      console.error("Failed to add cookies:", e);
+    }
+  }
+
+  if (fingerprint) {
+    await context.addInitScript((fp) => {
+      Object.defineProperty(navigator, 'platform', { get: () => fp.platform });
+      Object.defineProperty(navigator, 'languages', { get: () => fp.languages });
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return fp.webglVendor;
+        if (parameter === 37446) return fp.webglRenderer;
+        return getParameter.apply(this, [parameter]);
+      };
+      const getImageData = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+        const imageData = getImageData.apply(this, [x, y, w, h]);
+        const seed = fp.canvasSeed;
+        for (let i = 0; i < imageData.data.length; i += 4) {
+          imageData.data[i] = imageData.data[i] + (Math.sin(seed + i) * 2);
+        }
+        return imageData;
+      };
+    }, fingerprint);
+  }
+
+  activeServers.set(profileId, browserServer);
+  activeContexts.set(profileId, context);
+  
+  const page = await context.newPage();
+  let exitIp = "Detecting...";
+  try {
+    const ipResponse = await page.goto("https://api.ipify.org?format=json", { timeout: 5000 });
+    if (ipResponse && ipResponse.ok()) {
+      const data = await ipResponse.json();
+      exitIp = data.ip;
+    }
+  } catch (e) {
+    exitIp = profile.proxyHost || "Local";
+  }
+
+  sessions.set(profileId, {
+    profileId,
+    profileName: profile.name,
+    startTime: Date.now(),
+    wsEndpoint,
+    ip: exitIp,
+    proxyHost: profile.proxyHost
+  });
+
+  browserServer.on('close', () => {
+    activeServers.delete(profileId);
+    activeContexts.delete(profileId);
+    sessions.delete(profileId);
+  });
+
+  return { wsEndpoint, context };
+}
 
 // Initialize database
 db.exec(`
@@ -211,87 +321,108 @@ async function startServer() {
     }
   });
 
+  app.get("/api/sessions", (req, res) => {
+    res.json(Array.from(sessions.values()));
+  });
+
+  app.delete("/api/sessions/:id", async (req, res) => {
+    const { id } = req.params;
+    const profileId = parseInt(id);
+
+    try {
+      const server = activeServers.get(profileId);
+      if (server) {
+        await server.close();
+        activeServers.delete(profileId);
+        activeContexts.delete(profileId);
+        sessions.delete(profileId);
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Session not found" });
+      }
+    } catch (error) {
+      res.status(500).json({ error: "Failed to stop browser" });
+    }
+  });
+
   app.post("/api/profiles/:id/launch", async (req, res) => {
     const { id } = req.params;
     const profileId = parseInt(id);
 
     try {
-      const profile = db.prepare("SELECT * FROM profiles WHERE id = ?").get(profileId) as any;
-      if (!profile) {
-        return res.status(404).json({ error: "Profile not found" });
-      }
-
-      if (activeServers.has(profileId)) {
-        return res.status(400).json({ error: "Profile already launched" });
-      }
-
-      const fingerprint = profile.fingerprint ? JSON.parse(profile.fingerprint) : null;
-      const proxy = profile.proxyHost ? {
-        server: `${profile.proxyHost}:${profile.proxyPort}`,
-        username: profile.proxyUsername || undefined,
-        password: profile.proxyPassword || undefined,
-      } : undefined;
-
-      const browserServer = await chromium.launchServer({ 
-        headless: false,
-        proxy
-      });
-      const wsEndpoint = browserServer.wsEndpoint();
-      const browser = await chromium.connect({ wsEndpoint });
-      
-      const context = await browser.newContext({
-        userAgent: fingerprint?.userAgent,
-        viewport: fingerprint ? { width: fingerprint.screenWidth, height: fingerprint.screenHeight } : undefined,
-        timezoneId: fingerprint?.timezone,
-        locale: fingerprint?.languages?.[0],
-      });
-
-      if (profile.cookies) {
-        try {
-          const cookies = JSON.parse(profile.cookies);
-          await context.addCookies(cookies);
-        } catch (e) {
-          console.error("Failed to add cookies:", e);
-        }
-      }
-
-      if (fingerprint) {
-        await context.addInitScript((fp) => {
-          // Spoof Navigator
-          Object.defineProperty(navigator, 'platform', { get: () => fp.platform });
-          Object.defineProperty(navigator, 'languages', { get: () => fp.languages });
-          
-          // Spoof WebGL
-          const getParameter = WebGLRenderingContext.prototype.getParameter;
-          WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return fp.webglVendor; // UNMASKED_VENDOR_WEBGL
-            if (parameter === 37446) return fp.webglRenderer; // UNMASKED_RENDERER_WEBGL
-            return getParameter.apply(this, [parameter]);
-          };
-
-          // Canvas noise
-          const getImageData = CanvasRenderingContext2D.prototype.getImageData;
-          CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
-            const imageData = getImageData.apply(this, [x, y, w, h]);
-            const seed = fp.canvasSeed;
-            for (let i = 0; i < imageData.data.length; i += 4) {
-              imageData.data[i] = imageData.data[i] + (Math.sin(seed + i) * 2);
-            }
-            return imageData;
-          };
-        }, fingerprint);
-      }
-
-      activeServers.set(profileId, browserServer);
-      activeContexts.set(profileId, context);
-      
-      const page = await context.newPage();
+      const { wsEndpoint, context } = await launchProfile(profileId);
+      const pages = context.pages();
+      const page = pages.length > 0 ? pages[0] : await context.newPage();
       await page.goto("https://browserleaks.com/ip");
-      
       res.json({ wsEndpoint });
     } catch (error) {
       console.error("Launch error:", error);
-      res.status(500).json({ error: "Failed to launch browser" });
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to launch browser" });
+    }
+  });
+
+  app.get("/api/scripts", async (req, res) => {
+    try {
+      const scriptsDir = path.join(__dirname, "scripts");
+      if (!fs.existsSync(scriptsDir)) {
+        return res.json([]);
+      }
+      const files = await fs.promises.readdir(scriptsDir);
+      res.json(files.filter(f => f.endsWith(".js")));
+    } catch (error) {
+      res.status(500).json({ error: "Failed to list scripts" });
+    }
+  });
+
+  app.post("/api/scripts/run", async (req, res) => {
+    const { scriptName, profileId } = req.body;
+    const runId = Math.random().toString(36).substring(7);
+
+    try {
+      const { context } = await launchProfile(profileId);
+      const pages = context.pages();
+      const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+      const scriptPath = path.join(__dirname, "scripts", scriptName);
+      const scriptUrl = `file://${scriptPath}`;
+      const module = await import(scriptUrl);
+
+      if (typeof module.run !== "function") {
+        throw new Error("Script does not export a run function");
+      }
+
+      // Capture browser console logs
+      page.on('console', msg => {
+        scriptLogs.emit('log', { runId, text: `[Browser] ${msg.text()}` });
+      });
+
+      // We'll provide a custom console to the script if we can, 
+      // but for now let's just use a simple wrapper or tell the user to use a global logger.
+      // Since we want "live console output", we'll override console.log temporarily for this async context.
+      const originalLog = console.log;
+      const logWrapper = (...args: any[]) => {
+        const text = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+        scriptLogs.emit('log', { runId, text });
+        originalLog(...args);
+      };
+
+      // This is a bit hacky but works for simple scripts
+      const oldLog = console.log;
+      console.log = logWrapper;
+      
+      try {
+        scriptLogs.emit('log', { runId, text: `Starting script: ${scriptName}` });
+        await module.run(page);
+        scriptLogs.emit('log', { runId, text: `Script completed successfully.` });
+      } finally {
+        console.log = oldLog;
+      }
+
+      res.json({ success: true, runId });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      scriptLogs.emit('log', { runId, text: `Error: ${errorMsg}` });
+      res.status(500).json({ error: errorMsg });
     }
   });
 
@@ -305,6 +436,7 @@ async function startServer() {
         await server.close();
         activeServers.delete(profileId);
         activeContexts.delete(profileId);
+        sessions.delete(profileId);
         res.json({ success: true });
       } else {
         res.status(404).json({ error: "Session not found" });
@@ -329,8 +461,19 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  const wss = new WebSocketServer({ server });
+  wss.on('connection', (ws) => {
+    const onLog = (data: any) => {
+      ws.send(JSON.stringify(data));
+    };
+    scriptLogs.on('log', onLog);
+    ws.on('close', () => {
+      scriptLogs.off('log', onLog);
+    });
   });
 }
 

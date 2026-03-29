@@ -1,5 +1,5 @@
 import { useState, useEffect, type FormEvent } from "react";
-import { Plus, Trash2, Rocket, Shield, Globe, User, X, Loader2, Fingerprint as FingerprintIcon, Monitor, Cpu, Edit, Cookie } from "lucide-react";
+import { Plus, Trash2, Rocket, Shield, Globe, User, X, Loader2, Fingerprint as FingerprintIcon, Monitor, Cpu, Edit, Cookie, Activity, Clock, Server } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/src/lib/utils";
 import { generateFingerprint, type Fingerprint } from "@/src/lib/fingerprint";
@@ -24,6 +24,41 @@ interface Profile {
   wsEndpoint?: string;
 }
 
+interface Session {
+  profileId: number;
+  profileName: string;
+  startTime: number;
+  wsEndpoint: string;
+  ip: string;
+  proxyHost: string | null;
+}
+
+function Uptime({ startTime }: { startTime: number }) {
+  const [uptime, setUptime] = useState("");
+
+  useEffect(() => {
+    const update = () => {
+      const diff = Date.now() - startTime;
+      const seconds = Math.floor(diff / 1000);
+      const minutes = Math.floor(seconds / 60);
+      const hours = Math.floor(minutes / 60);
+      
+      const parts = [];
+      if (hours > 0) parts.push(`${hours}h`);
+      if (minutes % 60 > 0) parts.push(`${minutes % 60}m`);
+      parts.push(`${seconds % 60}s`);
+      
+      setUptime(parts.join(" "));
+    };
+
+    update();
+    const interval = setInterval(update, 1000);
+    return () => clearInterval(interval);
+  }, [startTime]);
+
+  return <span>{uptime}</span>;
+}
+
 export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
@@ -40,6 +75,11 @@ export default function App() {
   const [stoppingId, setStoppingId] = useState<number | null>(null);
   const [testingId, setTestingId] = useState<number | null>(null);
   const [proxyTestResults, setProxyTestResults] = useState<Record<number, { success: boolean; data?: any; error?: string }>>({});
+  const [currentView, setCurrentView] = useState<"profiles" | "sessions" | "scripts">("profiles");
+  const [activeSessions, setActiveSessions] = useState<Session[]>([]);
+  const [scripts, setScripts] = useState<string[]>([]);
+  const [scriptLogs, setScriptLogs] = useState<Record<string, string[]>>({});
+  const [runningScript, setRunningScript] = useState<string | null>(null);
 
   const [formData, setFormData] = useState({
     name: "",
@@ -57,8 +97,79 @@ export default function App() {
   });
 
   useEffect(() => {
-    Promise.all([fetchProfiles(), fetchGroups()]).finally(() => setIsLoading(false));
+    Promise.all([fetchProfiles(), fetchGroups(), fetchScripts()]).finally(() => setIsLoading(false));
   }, []);
+
+  useEffect(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${window.location.host}`);
+    
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.runId && data.text) {
+        setScriptLogs(prev => ({
+          ...prev,
+          [data.runId]: [...(prev[data.runId] || []), data.text]
+        }));
+      }
+    };
+
+    return () => ws.close();
+  }, []);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (currentView === "sessions") {
+      fetchSessions();
+      interval = setInterval(fetchSessions, 3000);
+    } else {
+      // Still fetch once in a while to update the badge count
+      fetchSessions();
+      interval = setInterval(fetchSessions, 10000);
+    }
+    return () => clearInterval(interval);
+  }, [currentView]);
+
+  const fetchSessions = async () => {
+    try {
+      const res = await fetch("/api/sessions");
+      const data = await res.json();
+      setActiveSessions(data);
+    } catch (error) {
+      console.error("Failed to fetch sessions:", error);
+    }
+  };
+
+  const fetchScripts = async () => {
+    try {
+      const res = await fetch("/api/scripts");
+      const data = await res.json();
+      setScripts(data);
+    } catch (error) {
+      console.error("Failed to fetch scripts:", error);
+    }
+  };
+
+  const runScript = async (scriptName: string, profileId: number) => {
+    setRunningScript(scriptName);
+    try {
+      const res = await fetch("/api/scripts/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scriptName, profileId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      
+      (window as any)[`last_run_${scriptName}`] = data.runId;
+      setScriptLogs(prev => ({ ...prev, [data.runId]: [] }));
+    } catch (error) {
+      console.error("Failed to run script:", error);
+      alert(error instanceof Error ? error.message : "Failed to run script");
+    } finally {
+      setRunningScript(null);
+    }
+  };
 
   const fetchProfiles = async () => {
     try {
@@ -238,9 +349,10 @@ export default function App() {
   const handleStop = async (id: number) => {
     setStoppingId(id);
     try {
-      const res = await fetch(`/api/profiles/${id}/stop`, { method: "POST" });
+      const res = await fetch(`/api/sessions/${id}`, { method: "DELETE" });
       if (res.ok) {
         setProfiles(profiles.map(p => p.id === id ? { ...p, wsEndpoint: undefined } : p));
+        setActiveSessions(prev => prev.filter(s => s.profileId !== id));
       } else {
         const data = await res.json();
         alert(data.error || "Failed to stop browser");
@@ -317,24 +429,59 @@ export default function App() {
         </div>
 
         <nav className="flex-1 overflow-y-auto p-4 space-y-1">
+          <div className="px-4 py-2 text-[10px] font-bold text-white/20 uppercase tracking-widest">Main</div>
           <button
-            onClick={() => setSelectedGroupId(null)}
+            onClick={() => {
+              setCurrentView("profiles");
+              setSelectedGroupId(null);
+            }}
             className={cn(
               "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all text-sm font-medium",
-              selectedGroupId === null ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
+              currentView === "profiles" && selectedGroupId === null ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
             )}
           >
-            <div className="w-2 h-2 rounded-full bg-white" />
+            <User className="w-4 h-4" />
             All Profiles
           </button>
 
+          <button
+            onClick={() => setCurrentView("sessions")}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all text-sm font-medium",
+              currentView === "sessions" ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
+            )}
+          >
+            <Activity className="w-4 h-4" />
+            Active Sessions
+            {activeSessions.length > 0 && (
+              <span className="ml-auto bg-orange-500 text-black text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                {activeSessions.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setCurrentView("scripts")}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all text-sm font-medium",
+              currentView === "scripts" ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
+            )}
+          >
+            <Rocket className="w-4 h-4" />
+            Automation
+          </button>
+
+          <div className="pt-4 px-4 py-2 text-[10px] font-bold text-white/20 uppercase tracking-widest">Groups</div>
           {groups.map(group => (
             <button
               key={group.id}
-              onClick={() => setSelectedGroupId(group.id)}
+              onClick={() => {
+                setCurrentView("profiles");
+                setSelectedGroupId(group.id);
+              }}
               className={cn(
                 "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all text-sm font-medium",
-                selectedGroupId === group.id ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
+                currentView === "profiles" && selectedGroupId === group.id ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
               )}
             >
               <div className="w-2 h-2 rounded-full" style={{ backgroundColor: group.color }} />
@@ -360,19 +507,21 @@ export default function App() {
           <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold tracking-tight">
-                {selectedGroupId ? groups.find(g => g.id === selectedGroupId)?.name : "All Profiles"}
+                {currentView === "sessions" ? "Active Sessions" : (selectedGroupId ? groups.find(g => g.id === selectedGroupId)?.name : "All Profiles")}
               </h1>
               <p className="text-xs text-white/40 font-mono uppercase tracking-widest">
-                {filteredProfiles.length} Profiles
+                {currentView === "sessions" ? `${activeSessions.length} Running` : `${filteredProfiles.length} Profiles`}
               </p>
             </div>
-            <button
-              onClick={() => setIsModalOpen(true)}
-              className="flex items-center gap-2 bg-white text-black px-5 py-2.5 rounded-full font-semibold hover:bg-orange-500 transition-all active:scale-95 shadow-xl shadow-white/5"
-            >
-              <Plus className="w-4 h-4" />
-              New Profile
-            </button>
+            {currentView === "profiles" && (
+              <button
+                onClick={() => setIsModalOpen(true)}
+                className="flex items-center gap-2 bg-white text-black px-5 py-2.5 rounded-full font-semibold hover:bg-orange-500 transition-all active:scale-95 shadow-xl shadow-white/5"
+              >
+                <Plus className="w-4 h-4" />
+                New Profile
+              </button>
+            )}
           </div>
         </header>
 
@@ -382,6 +531,161 @@ export default function App() {
             <div className="flex flex-col items-center justify-center py-32 gap-4">
               <Loader2 className="w-10 h-10 text-orange-500 animate-spin" />
               <p className="text-white/40 font-mono text-sm">Initializing database...</p>
+            </div>
+          ) : currentView === "sessions" ? (
+            <div className="space-y-6">
+              {activeSessions.length === 0 ? (
+                <div className="text-center py-32 border-2 border-dashed border-white/5 rounded-3xl bg-white/[0.02]">
+                  <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6">
+                    <Activity className="w-10 h-10 text-white/20" />
+                  </div>
+                  <h2 className="text-2xl font-semibold mb-2">No active sessions</h2>
+                  <p className="text-white/40 mb-8 max-w-md mx-auto">
+                    Launch a profile to see it here. Active sessions are tracked in real-time.
+                  </p>
+                  <button
+                    onClick={() => setCurrentView("profiles")}
+                    className="text-orange-500 font-semibold hover:underline"
+                  >
+                    Go to Profiles →
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 gap-4">
+                  {activeSessions.map((session) => (
+                    <motion.div
+                      key={session.profileId}
+                      initial={{ opacity: 0, x: -20 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      className="bg-white/[0.03] border border-white/10 rounded-3xl p-6 flex items-center justify-between hover:bg-white/[0.05] transition-all"
+                    >
+                      <div className="flex items-center gap-6">
+                        <div className="w-14 h-14 bg-orange-500/10 rounded-2xl flex items-center justify-center">
+                          <Rocket className="w-7 h-7 text-orange-500" />
+                        </div>
+                        <div className="space-y-1">
+                          <h3 className="font-bold text-lg">{session.profileName}</h3>
+                          <div className="flex items-center gap-4">
+                            <div className="flex items-center gap-1.5 text-xs text-white/40">
+                              <Clock className="w-3.5 h-3.5" />
+                              <Uptime startTime={session.startTime} />
+                            </div>
+                            <div className="flex items-center gap-1.5 text-xs text-white/40">
+                              <Server className="w-3.5 h-3.5" />
+                              <span className="font-mono">{session.ip}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      
+                      <div className="flex items-center gap-4">
+                        <div className="text-right hidden md:block">
+                          <p className="text-[10px] font-bold text-white/20 uppercase tracking-widest">WS Endpoint</p>
+                          <p className="text-xs font-mono text-white/40 max-w-[200px] truncate">{session.wsEndpoint}</p>
+                        </div>
+                        <button
+                          onClick={() => handleStop(session.profileId)}
+                          disabled={stoppingId === session.profileId}
+                          className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-6 py-3 rounded-2xl font-bold transition-all disabled:opacity-50 flex items-center gap-2"
+                        >
+                          {stoppingId === session.profileId ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <>
+                              <X className="w-4 h-4" />
+                              Stop
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : currentView === "scripts" ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+              {scripts.map(script => (
+                <motion.div 
+                  key={script}
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="bg-white/[0.03] border border-white/10 rounded-3xl p-8 hover:bg-white/[0.05] transition-all flex flex-col"
+                >
+                  <div className="flex items-center gap-4 mb-8">
+                    <div className="w-12 h-12 bg-orange-500/10 rounded-2xl flex items-center justify-center">
+                      <Rocket className="w-6 h-6 text-orange-500" />
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-xl">{script}</h3>
+                      <p className="text-sm text-white/40 uppercase tracking-widest font-bold">Automation Script</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-6 flex-1">
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Target Profile</label>
+                      <select 
+                        className="w-full bg-white/5 border border-white/10 rounded-2xl px-5 py-3.5 text-sm focus:outline-none focus:border-orange-500/50 transition-colors"
+                        onChange={(e) => {
+                          const profileId = parseInt(e.target.value);
+                          (window as any)[`selected_profile_${script}`] = profileId;
+                        }}
+                      >
+                        <option value="">Choose a profile...</option>
+                        {profiles.map(p => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        const profileId = (window as any)[`selected_profile_${script}`];
+                        if (!profileId) return alert("Please select a profile");
+                        runScript(script, profileId);
+                      }}
+                      disabled={runningScript === script}
+                      className="w-full flex items-center justify-center gap-3 bg-orange-500 text-black px-6 py-4 rounded-2xl font-bold text-sm hover:bg-orange-400 transition-all disabled:opacity-50 shadow-xl shadow-orange-500/10"
+                    >
+                      {runningScript === script ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : (
+                        <>
+                          <Rocket className="w-5 h-5" />
+                          Run Automation
+                        </>
+                      )}
+                    </button>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white/40 uppercase tracking-widest">Console Output</span>
+                        <button 
+                          onClick={() => {
+                            const lastRunId = (window as any)[`last_run_${script}`];
+                            if (lastRunId) setScriptLogs(prev => ({ ...prev, [lastRunId]: [] }));
+                          }}
+                          className="text-[10px] text-white/20 hover:text-white transition-colors uppercase tracking-widest font-bold"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                      <div className="bg-black/50 border border-white/5 rounded-2xl p-5 h-64 overflow-y-auto font-mono text-[11px] space-y-1.5 scrollbar-thin scrollbar-thumb-white/10">
+                        {(scriptLogs[(window as any)[`last_run_${script}`]] || []).map((log, i) => (
+                          <div key={i} className="text-white/60 flex gap-3">
+                            <span className="text-white/20 shrink-0">[{new Date().toLocaleTimeString()}]</span>
+                            <span className="break-all">{log}</span>
+                          </div>
+                        ))}
+                        {(!scriptLogs[(window as any)[`last_run_${script}`]] || scriptLogs[(window as any)[`last_run_${script}`]].length === 0) && (
+                          <div className="text-white/10 italic py-2">Waiting for script execution...</div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              ))}
             </div>
           ) : filteredProfiles.length === 0 ? (
             <div className="text-center py-32 border-2 border-dashed border-white/5 rounded-3xl bg-white/[0.02]">
