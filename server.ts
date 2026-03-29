@@ -14,6 +14,12 @@ const activeContexts = new Map<number, BrowserContext>();
 
 // Initialize database
 db.exec(`
+  CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -22,8 +28,11 @@ db.exec(`
     proxyUsername TEXT,
     proxyPassword TEXT,
     fingerprint TEXT,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
+    cookies TEXT,
+    group_id INTEGER,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL
+  );
 `);
 
 async function startServer() {
@@ -33,6 +42,29 @@ async function startServer() {
   app.use(express.json());
 
   // API Routes
+  app.get("/api/groups", (req, res) => {
+    try {
+      const groups = db.prepare("SELECT * FROM groups ORDER BY name ASC").all();
+      res.json(groups);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch groups" });
+    }
+  });
+
+  app.post("/api/groups", (req, res) => {
+    const { name, color } = req.body;
+    if (!name || !color) {
+      return res.status(400).json({ error: "Name and color are required" });
+    }
+    try {
+      const info = db.prepare("INSERT INTO groups (name, color) VALUES (?, ?)").run(name, color);
+      const newGroup = db.prepare("SELECT * FROM groups WHERE id = ?").get(info.lastInsertRowid);
+      res.status(201).json(newGroup);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create group" });
+    }
+  });
+
   app.get("/api/profiles", (req, res) => {
     try {
       const profiles = db.prepare("SELECT * FROM profiles ORDER BY createdAt DESC").all();
@@ -43,28 +75,84 @@ async function startServer() {
   });
 
   app.post("/api/profiles", (req, res) => {
-    const { name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint } = req.body;
+    const { name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint, group_id, cookies } = req.body;
     if (!name) {
       return res.status(400).json({ error: "Name is required" });
     }
 
     try {
       const info = db.prepare(`
-        INSERT INTO profiles (name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO profiles (name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint, group_id, cookies)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         name, 
         proxyHost || null, 
         proxyPort || null, 
         proxyUsername || null, 
         proxyPassword || null,
-        fingerprint ? JSON.stringify(fingerprint) : null
+        fingerprint ? JSON.stringify(fingerprint) : null,
+        group_id || null,
+        cookies ? JSON.stringify(cookies) : null
       );
       
       const newProfile = db.prepare("SELECT * FROM profiles WHERE id = ?").get(info.lastInsertRowid);
       res.status(201).json(newProfile);
     } catch (error) {
       res.status(500).json({ error: "Failed to create profile" });
+    }
+  });
+
+  app.put("/api/profiles/:id", (req, res) => {
+    const { id } = req.params;
+    const { name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint, group_id } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+
+    try {
+      db.prepare(`
+        UPDATE profiles 
+        SET name = ?, proxyHost = ?, proxyPort = ?, proxyUsername = ?, proxyPassword = ?, fingerprint = ?, group_id = ?
+        WHERE id = ?
+      `).run(
+        name,
+        proxyHost || null,
+        proxyPort || null,
+        proxyUsername || null,
+        proxyPassword || null,
+        fingerprint ? JSON.stringify(fingerprint) : null,
+        group_id || null,
+        id
+      );
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update profile" });
+    }
+  });
+
+  app.patch("/api/profiles/:id/cookies", (req, res) => {
+    const { id } = req.params;
+    const { cookies } = req.body;
+    try {
+      db.prepare("UPDATE profiles SET cookies = ? WHERE id = ?").run(
+        cookies ? JSON.stringify(cookies) : null,
+        id
+      );
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update cookies" });
+    }
+  });
+
+  app.patch("/api/profiles/:id", (req, res) => {
+    const { id } = req.params;
+    const { group_id } = req.body;
+    try {
+      db.prepare("UPDATE profiles SET group_id = ? WHERE id = ?").run(group_id || null, id);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update profile" });
     }
   });
 
@@ -78,6 +166,48 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete profile" });
+    }
+  });
+
+  app.post("/api/proxies/check", async (req, res) => {
+    const { proxyHost, proxyPort, proxyUsername, proxyPassword } = req.body;
+    
+    if (!proxyHost || !proxyPort) {
+      return res.status(400).json({ error: "Proxy host and port are required" });
+    }
+
+    const proxy = {
+      server: `${proxyHost}:${proxyPort}`,
+      username: proxyUsername || undefined,
+      password: proxyPassword || undefined,
+    };
+
+    const startTime = Date.now();
+    let browser;
+    try {
+      browser = await chromium.launch({ headless: true });
+      const context = await browser.newContext({ proxy });
+      const page = await context.newPage();
+      
+      const response = await page.goto("https://ipinfo.io/json", { timeout: 10000 });
+      if (!response || !response.ok()) {
+        throw new Error(`Failed to connect: ${response?.status() || 'Unknown error'}`);
+      }
+
+      const data = await response.json();
+      const latency = Date.now() - startTime;
+
+      res.json({
+        ip: data.ip,
+        country: data.country,
+        city: data.city,
+        latency,
+      });
+    } catch (error) {
+      console.error("Proxy check error:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Proxy connection failed" });
+    } finally {
+      if (browser) await browser.close();
     }
   });
 
@@ -115,6 +245,15 @@ async function startServer() {
         timezoneId: fingerprint?.timezone,
         locale: fingerprint?.languages?.[0],
       });
+
+      if (profile.cookies) {
+        try {
+          const cookies = JSON.parse(profile.cookies);
+          await context.addCookies(cookies);
+        } catch (e) {
+          console.error("Failed to add cookies:", e);
+        }
+      }
 
       if (fingerprint) {
         await context.addInitScript((fp) => {
