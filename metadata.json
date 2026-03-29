@@ -1,0 +1,5 @@
+{
+  "name": "Browser Profile Manager",
+  "description": "A personal browser profile manager with proxy support and SQLite storage.",
+  "requestFramePermissions": []
+}
