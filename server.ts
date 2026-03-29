@@ -7,11 +7,47 @@ import { chromium, type BrowserServer, type BrowserContext } from "playwright";
 import { WebSocketServer, WebSocket } from "ws";
 import fs from "fs";
 import { EventEmitter } from "events";
+import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const db = new Database("profiles.db");
+
+// Initialize database
+db.exec(`
+  CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    proxyHost TEXT,
+    proxyPort TEXT,
+    proxyUsername TEXT,
+    proxyPassword TEXT,
+    fingerprint TEXT,
+    cookies TEXT,
+    group_id INTEGER,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    browser_mode TEXT DEFAULT 'headful',
+    max_concurrent_profiles INTEGER DEFAULT 5,
+    default_timezone TEXT DEFAULT 'UTC',
+    api_key TEXT
+  );
+
+  INSERT OR IGNORE INTO settings (id, browser_mode, max_concurrent_profiles, default_timezone)
+  VALUES (1, 'headful', 5, 'UTC');
+`);
+
 const activeServers = new Map<number, BrowserServer>();
 const activeContexts = new Map<number, BrowserContext>();
 
@@ -28,10 +64,16 @@ const sessions = new Map<number, SessionInfo>();
 const scriptLogs = new EventEmitter();
 
 async function launchProfile(profileId: number) {
+  const settings = db.prepare("SELECT * FROM settings WHERE id = 1").get() as any;
+
   if (activeServers.has(profileId)) {
     const wsEndpoint = activeServers.get(profileId)!.wsEndpoint();
     const context = activeContexts.get(profileId)!;
     return { wsEndpoint, context };
+  }
+
+  if (activeServers.size >= settings.max_concurrent_profiles) {
+    throw new Error(`Max concurrent profiles (${settings.max_concurrent_profiles}) reached. Stop another session first.`);
   }
 
   const profile = db.prepare("SELECT * FROM profiles WHERE id = ?").get(profileId) as any;
@@ -45,7 +87,7 @@ async function launchProfile(profileId: number) {
   } : undefined;
 
   const browserServer = await chromium.launchServer({ 
-    headless: false,
+    headless: settings.browser_mode === 'headless',
     proxy
   });
   const wsEndpoint = browserServer.wsEndpoint();
@@ -54,7 +96,7 @@ async function launchProfile(profileId: number) {
   const context = await browser.newContext({
     userAgent: fingerprint?.userAgent,
     viewport: fingerprint ? { width: fingerprint.screenWidth, height: fingerprint.screenHeight } : undefined,
-    timezoneId: fingerprint?.timezone,
+    timezoneId: fingerprint?.timezone || settings.default_timezone,
     locale: fingerprint?.languages?.[0],
   });
 
@@ -123,27 +165,26 @@ async function launchProfile(profileId: number) {
 }
 
 // Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    color TEXT NOT NULL
-  );
+// (Moved up)
 
-  CREATE TABLE IF NOT EXISTS profiles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    proxyHost TEXT,
-    proxyPort TEXT,
-    proxyUsername TEXT,
-    proxyPassword TEXT,
-    fingerprint TEXT,
-    cookies TEXT,
-    group_id INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL
-  );
-`);
+const checkApiKey = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const settings = db.prepare("SELECT api_key FROM settings WHERE id = 1").get() as any;
+  if (!settings?.api_key) {
+    return next();
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized: Missing API Key" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  if (token !== settings.api_key) {
+    return res.status(401).json({ error: "Unauthorized: Invalid API Key" });
+  }
+
+  next();
+};
 
 async function startServer() {
   const app = express();
@@ -345,7 +386,71 @@ async function startServer() {
     }
   });
 
-  app.post("/api/profiles/:id/launch", async (req, res) => {
+  app.get("/api/profiles/export", (req, res) => {
+    const includePasswords = req.query.includePasswords === 'true';
+    try {
+      const profiles = db.prepare("SELECT * FROM profiles").all() as any[];
+      const exportData = profiles.map(p => {
+        const { id, createdAt, ...rest } = p;
+        if (!includePasswords) {
+          rest.proxyPassword = null;
+        }
+        return rest;
+      });
+      res.json(exportData);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to export profiles" });
+    }
+  });
+
+  app.post("/api/profiles/import", (req, res) => {
+    const profiles = req.body;
+    if (!Array.isArray(profiles)) {
+      return res.status(400).json({ error: "Invalid data format: Expected an array of profiles" });
+    }
+
+    let importedCount = 0;
+    let skippedCount = 0;
+
+    const insertStmt = db.prepare(`
+      INSERT INTO profiles (name, proxyHost, proxyPort, proxyUsername, proxyPassword, fingerprint, group_id, cookies)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const checkStmt = db.prepare("SELECT id FROM profiles WHERE name = ?");
+
+    const transaction = db.transaction((profilesToImport) => {
+      for (const profile of profilesToImport) {
+        const existing = checkStmt.get(profile.name);
+        if (existing) {
+          skippedCount++;
+          continue;
+        }
+
+        insertStmt.run(
+          profile.name,
+          profile.proxyHost || null,
+          profile.proxyPort || null,
+          profile.proxyUsername || null,
+          profile.proxyPassword || null,
+          profile.fingerprint || null,
+          profile.group_id || null,
+          profile.cookies || null
+        );
+        importedCount++;
+      }
+    });
+
+    try {
+      transaction(profiles);
+      res.json({ success: true, importedCount, skippedCount });
+    } catch (error) {
+      console.error("Import error:", error);
+      res.status(500).json({ error: "Failed to import profiles" });
+    }
+  });
+
+  app.post("/api/profiles/:id/launch", checkApiKey, async (req, res) => {
     const { id } = req.params;
     const profileId = parseInt(id);
 
@@ -374,7 +479,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/scripts/run", async (req, res) => {
+  app.post("/api/scripts/run", checkApiKey, async (req, res) => {
     const { scriptName, profileId } = req.body;
     const runId = Math.random().toString(36).substring(7);
 
@@ -443,6 +548,67 @@ async function startServer() {
       }
     } catch (error) {
       res.status(500).json({ error: "Failed to stop browser" });
+    }
+  });
+
+  // Settings API
+  app.get("/api/settings", (req, res) => {
+    try {
+      const settings = db.prepare("SELECT browser_mode, max_concurrent_profiles, default_timezone, api_key FROM settings WHERE id = 1").get() as any;
+      res.json({
+        ...settings,
+        api_key: settings.api_key ? "********" : null,
+        has_api_key: !!settings.api_key
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch settings" });
+    }
+  });
+
+  app.patch("/api/settings", (req, res) => {
+    const { browser_mode, max_concurrent_profiles, default_timezone } = req.body;
+    try {
+      db.prepare(`
+        UPDATE settings 
+        SET browser_mode = ?, max_concurrent_profiles = ?, default_timezone = ?
+        WHERE id = 1
+      `).run(browser_mode, max_concurrent_profiles, default_timezone);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update settings" });
+    }
+  });
+
+  app.post("/api/settings/generate-api-key", (req, res) => {
+    try {
+      const apiKey = crypto.randomUUID();
+      db.prepare("UPDATE settings SET api_key = ? WHERE id = 1").run(apiKey);
+      res.json({ apiKey });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to generate API key" });
+    }
+  });
+
+  app.post("/api/settings/clear-sessions", async (req, res) => {
+    try {
+      for (const [profileId, server] of activeServers.entries()) {
+        await server.close();
+      }
+      activeServers.clear();
+      activeContexts.clear();
+      sessions.clear();
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to clear sessions" });
+    }
+  });
+
+  app.post("/api/settings/vacuum", (req, res) => {
+    try {
+      db.exec("VACUUM");
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to vacuum database" });
     }
   });
 

@@ -1,5 +1,5 @@
-import { useState, useEffect, type FormEvent } from "react";
-import { Plus, Trash2, Rocket, Shield, Globe, User, X, Loader2, Fingerprint as FingerprintIcon, Monitor, Cpu, Edit, Cookie, Activity, Clock, Server } from "lucide-react";
+import { useState, useEffect, type FormEvent, type ChangeEvent } from "react";
+import { Plus, Trash2, Rocket, Shield, Globe, User, X, Loader2, Fingerprint as FingerprintIcon, Monitor, Cpu, Edit, Cookie, Activity, Clock, Server, CheckCircle, AlertCircle, Info } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/src/lib/utils";
 import { generateFingerprint, type Fingerprint } from "@/src/lib/fingerprint";
@@ -31,6 +31,13 @@ interface Session {
   wsEndpoint: string;
   ip: string;
   proxyHost: string | null;
+}
+
+interface Settings {
+  browser_mode: 'headless' | 'headful';
+  max_concurrent_profiles: number;
+  default_timezone: string;
+  has_api_key: boolean;
 }
 
 function Uptime({ startTime }: { startTime: number }) {
@@ -75,11 +82,23 @@ export default function App() {
   const [stoppingId, setStoppingId] = useState<number | null>(null);
   const [testingId, setTestingId] = useState<number | null>(null);
   const [proxyTestResults, setProxyTestResults] = useState<Record<number, { success: boolean; data?: any; error?: string }>>({});
-  const [currentView, setCurrentView] = useState<"profiles" | "sessions" | "scripts">("profiles");
+  const [currentView, setCurrentView] = useState<"profiles" | "sessions" | "scripts" | "settings">("profiles");
   const [activeSessions, setActiveSessions] = useState<Session[]>([]);
   const [scripts, setScripts] = useState<string[]>([]);
   const [scriptLogs, setScriptLogs] = useState<Record<string, string[]>>({});
   const [runningScript, setRunningScript] = useState<string | null>(null);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [newApiKey, setNewApiKey] = useState<string | null>(null);
+  const [localApiKey, setLocalApiKey] = useState(localStorage.getItem("browser_manager_api_key") || "");
+  const [exportIncludePasswords, setExportIncludePasswords] = useState(false);
+
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
+
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3000);
+  };
 
   const [formData, setFormData] = useState({
     name: "",
@@ -97,7 +116,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    Promise.all([fetchProfiles(), fetchGroups(), fetchScripts()]).finally(() => setIsLoading(false));
+    Promise.all([fetchProfiles(), fetchGroups(), fetchScripts(), fetchSettings()]).finally(() => setIsLoading(false));
   }, []);
 
   useEffect(() => {
@@ -150,12 +169,140 @@ export default function App() {
     }
   };
 
+  const fetchSettings = async () => {
+    try {
+      const res = await fetch("/api/settings");
+      const data = await res.json();
+      setSettings(data);
+    } catch (error) {
+      console.error("Failed to fetch settings:", error);
+    }
+  };
+
+  const updateSettings = async (updates: Partial<Settings>) => {
+    if (!settings) return;
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...settings, ...updates }),
+      });
+      if (res.ok) {
+        await fetchSettings();
+      }
+    } catch (error) {
+      console.error("Failed to update settings:", error);
+    }
+  };
+
+  const generateApiKey = async () => {
+    try {
+      const res = await fetch("/api/settings/generate-api-key", { method: "POST" });
+      const data = await res.json();
+      setNewApiKey(data.apiKey);
+      localStorage.setItem("browser_manager_api_key", data.apiKey);
+      setLocalApiKey(data.apiKey);
+      await fetchSettings();
+    } catch (error) {
+      console.error("Failed to generate API key:", error);
+    }
+  };
+
+  const clearAllSessions = async () => {
+    setConfirmModal({
+      message: "Are you sure you want to stop all active browser sessions?",
+      onConfirm: async () => {
+        try {
+          const res = await fetch("/api/settings/clear-sessions", { method: "POST" });
+          if (res.ok) {
+            await fetchSessions();
+            await fetchProfiles();
+            showToast("All sessions cleared", "success");
+          }
+        } catch (error) {
+          console.error("Failed to clear sessions:", error);
+          showToast("Failed to clear sessions", "error");
+        }
+        setConfirmModal(null);
+      }
+    });
+  };
+
+  const vacuumDatabase = async () => {
+    try {
+      const res = await fetch("/api/settings/vacuum", { method: "POST" });
+      if (res.ok) {
+        showToast("Database vacuumed successfully!", "success");
+      }
+    } catch (error) {
+      console.error("Failed to vacuum database:", error);
+      showToast("Failed to vacuum database", "error");
+    }
+  };
+
+  const handleExportProfiles = async () => {
+    try {
+      const res = await fetch(`/api/profiles/export?includePasswords=${exportIncludePasswords}`);
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `profiles-backup-${new Date().toISOString().split('T')[0]}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast("Profiles exported successfully", "success");
+    } catch (error) {
+      console.error("Failed to export profiles:", error);
+      showToast("Failed to export profiles", "error");
+    }
+  };
+
+  const handleImportProfiles = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const profiles = JSON.parse(event.target?.result as string);
+        const res = await fetch("/api/profiles/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profiles),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          await fetchProfiles();
+          showToast(`Imported ${data.importedCount} profiles, skipped ${data.skippedCount} duplicates`, "success");
+        } else {
+          showToast(data.error || "Failed to import profiles", "error");
+        }
+      } catch (error) {
+        console.error("Failed to import profiles:", error);
+        showToast("Invalid backup file format", "error");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // Reset input
+  };
+
+  const getAuthHeaders = () => {
+    const key = localStorage.getItem("browser_manager_api_key");
+    return key ? { "Authorization": `Bearer ${key}` } : {};
+  };
+
   const runScript = async (scriptName: string, profileId: number) => {
     setRunningScript(scriptName);
     try {
       const res = await fetch("/api/scripts/run", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          ...getAuthHeaders()
+        },
         body: JSON.stringify({ scriptName, profileId }),
       });
       const data = await res.json();
@@ -165,7 +312,7 @@ export default function App() {
       setScriptLogs(prev => ({ ...prev, [data.runId]: [] }));
     } catch (error) {
       console.error("Failed to run script:", error);
-      alert(error instanceof Error ? error.message : "Failed to run script");
+      showToast(error instanceof Error ? error.message : "Failed to run script", "error");
     } finally {
       setRunningScript(null);
     }
@@ -296,7 +443,7 @@ export default function App() {
         cookies = JSON.parse(cookieJson);
         if (!Array.isArray(cookies)) throw new Error("Must be an array");
       } catch (e) {
-        alert("Invalid JSON: Cookies must be a JSON array.");
+        showToast("Invalid JSON: Cookies must be a JSON array.", "error");
         return;
       }
 
@@ -317,30 +464,41 @@ export default function App() {
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Are you sure you want to delete this profile?")) return;
-    try {
-      const res = await fetch(`/api/profiles/${id}`, { method: "DELETE" });
-      if (res.ok) {
-        setProfiles(profiles.filter((p) => p.id !== id));
+    setConfirmModal({
+      message: "Are you sure you want to delete this profile?",
+      onConfirm: async () => {
+        try {
+          const res = await fetch(`/api/profiles/${id}`, { method: "DELETE" });
+          if (res.ok) {
+            setProfiles(profiles.filter((p) => p.id !== id));
+            showToast("Profile deleted", "success");
+          }
+        } catch (error) {
+          console.error("Failed to delete profile:", error);
+          showToast("Failed to delete profile", "error");
+        }
+        setConfirmModal(null);
       }
-    } catch (error) {
-      console.error("Failed to delete profile:", error);
-    }
+    });
   };
 
   const handleLaunch = async (id: number) => {
     setLaunchingId(id);
     try {
-      const res = await fetch(`/api/profiles/${id}/launch`, { method: "POST" });
+      const res = await fetch(`/api/profiles/${id}/launch`, { 
+        method: "POST",
+        headers: getAuthHeaders()
+      });
       const data = await res.json();
       if (res.ok) {
         setProfiles(profiles.map(p => p.id === id ? { ...p, wsEndpoint: data.wsEndpoint } : p));
+        showToast("Browser launched", "success");
       } else {
-        alert(data.error || "Failed to launch browser");
+        showToast(data.error || "Failed to launch browser", "error");
       }
     } catch (error) {
       console.error("Failed to launch profile:", error);
-      alert("Failed to launch browser. Check server logs.");
+      showToast("Failed to launch browser. Check server logs.", "error");
     } finally {
       setLaunchingId(null);
     }
@@ -353,13 +511,14 @@ export default function App() {
       if (res.ok) {
         setProfiles(profiles.map(p => p.id === id ? { ...p, wsEndpoint: undefined } : p));
         setActiveSessions(prev => prev.filter(s => s.profileId !== id));
+        showToast("Browser stopped", "info");
       } else {
         const data = await res.json();
-        alert(data.error || "Failed to stop browser");
+        showToast(data.error || "Failed to stop browser", "error");
       }
     } catch (error) {
       console.error("Failed to stop profile:", error);
-      alert("Failed to stop browser.");
+      showToast("Failed to stop browser.", "error");
     } finally {
       setStoppingId(null);
     }
@@ -381,7 +540,7 @@ export default function App() {
 
   const handleTestProxy = async (profile: Profile) => {
     if (!profile.proxyHost || !profile.proxyPort) {
-      alert("This profile has no proxy configured.");
+      showToast("This profile has no proxy configured.", "info");
       return;
     }
 
@@ -471,6 +630,17 @@ export default function App() {
             Automation
           </button>
 
+          <button
+            onClick={() => setCurrentView("settings")}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all text-sm font-medium",
+              currentView === "settings" ? "bg-white/10 text-white" : "text-white/40 hover:bg-white/5 hover:text-white"
+            )}
+          >
+            <Server className="w-4 h-4" />
+            Settings
+          </button>
+
           <div className="pt-4 px-4 py-2 text-[10px] font-bold text-white/20 uppercase tracking-widest">Groups</div>
           {groups.map(group => (
             <button
@@ -507,10 +677,16 @@ export default function App() {
           <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold tracking-tight">
-                {currentView === "sessions" ? "Active Sessions" : (selectedGroupId ? groups.find(g => g.id === selectedGroupId)?.name : "All Profiles")}
+                {currentView === "sessions" ? "Active Sessions" : 
+                 currentView === "scripts" ? "Automation Scripts" :
+                 currentView === "settings" ? "System Settings" :
+                 (selectedGroupId ? groups.find(g => g.id === selectedGroupId)?.name : "All Profiles")}
               </h1>
               <p className="text-xs text-white/40 font-mono uppercase tracking-widest">
-                {currentView === "sessions" ? `${activeSessions.length} Running` : `${filteredProfiles.length} Profiles`}
+                {currentView === "sessions" ? `${activeSessions.length} Running` : 
+                 currentView === "scripts" ? `${scripts.length} Scripts` :
+                 currentView === "settings" ? "Configuration" :
+                 `${filteredProfiles.length} Profiles`}
               </p>
             </div>
             {currentView === "profiles" && (
@@ -642,7 +818,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         const profileId = (window as any)[`selected_profile_${script}`];
-                        if (!profileId) return alert("Please select a profile");
+                        if (!profileId) return showToast("Please select a profile", "info");
                         runScript(script, profileId);
                       }}
                       disabled={runningScript === script}
@@ -686,6 +862,200 @@ export default function App() {
                   </div>
                 </motion.div>
               ))}
+            </div>
+          ) : currentView === "settings" ? (
+            <div className="max-w-2xl mx-auto space-y-12">
+              <section className="space-y-6">
+                <div className="flex items-center gap-3 mb-2">
+                  <Monitor className="w-5 h-5 text-orange-500" />
+                  <h2 className="text-lg font-bold uppercase tracking-widest text-white/60">Browser Configuration</h2>
+                </div>
+                
+                <div className="bg-white/[0.03] border border-white/10 rounded-[2rem] p-8 space-y-8">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-bold">Launch Mode</h3>
+                      <p className="text-sm text-white/40">Headless runs in background, Headful shows browser window.</p>
+                    </div>
+                    <div className="flex bg-black/40 p-1 rounded-xl border border-white/5">
+                      <button
+                        onClick={() => updateSettings({ browser_mode: 'headful' })}
+                        className={cn(
+                          "px-4 py-2 rounded-lg text-xs font-bold transition-all",
+                          settings?.browser_mode === 'headful' ? "bg-white text-black shadow-lg" : "text-white/40 hover:text-white"
+                        )}
+                      >
+                        Headful
+                      </button>
+                      <button
+                        onClick={() => updateSettings({ browser_mode: 'headless' })}
+                        className={cn(
+                          "px-4 py-2 rounded-lg text-xs font-bold transition-all",
+                          settings?.browser_mode === 'headless' ? "bg-white text-black shadow-lg" : "text-white/40 hover:text-white"
+                        )}
+                      >
+                        Headless
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Max Concurrent Profiles</label>
+                    <input
+                      type="number"
+                      value={settings?.max_concurrent_profiles || 5}
+                      onChange={(e) => updateSettings({ max_concurrent_profiles: parseInt(e.target.value) })}
+                      className="w-full bg-black/40 border border-white/10 rounded-2xl px-5 py-4 focus:outline-none focus:border-orange-500 transition-all font-mono"
+                    />
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Default Timezone Fallback</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. UTC, America/New_York"
+                      value={settings?.default_timezone || "UTC"}
+                      onChange={(e) => updateSettings({ default_timezone: e.target.value })}
+                      className="w-full bg-black/40 border border-white/10 rounded-2xl px-5 py-4 focus:outline-none focus:border-orange-500 transition-all font-mono"
+                    />
+                  </div>
+                </div>
+              </section>
+
+              <section className="space-y-6">
+                <div className="flex items-center gap-3 mb-2">
+                  <Shield className="w-5 h-5 text-orange-500" />
+                  <h2 className="text-lg font-bold uppercase tracking-widest text-white/60">Security & API</h2>
+                </div>
+                
+                <div className="bg-white/[0.03] border border-white/10 rounded-[2rem] p-8 space-y-6">
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="font-bold">API Access Key</h3>
+                      <button
+                        onClick={generateApiKey}
+                        className="text-xs font-bold text-orange-500 hover:underline"
+                      >
+                        {settings?.has_api_key ? "Regenerate Key" : "Generate Key"}
+                      </button>
+                    </div>
+                    
+                    {newApiKey ? (
+                      <div className="bg-orange-500/10 border border-orange-500/20 rounded-2xl p-6 space-y-3">
+                        <p className="text-xs font-bold text-orange-500 uppercase tracking-widest">New Key Generated (Save it now!)</p>
+                        <div className="flex items-center gap-3">
+                          <code className="flex-1 bg-black/40 p-3 rounded-xl font-mono text-sm break-all">{newApiKey}</code>
+                          <button 
+                            onClick={() => {
+                              navigator.clipboard.writeText(newApiKey);
+                              showToast("Copied to clipboard!", "success");
+                            }}
+                            className="p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-all"
+                          >
+                            <Cookie className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-white/40 leading-relaxed">
+                          This key will only be shown once. Use it in the <code>Authorization: Bearer &lt;key&gt;</code> header for API requests.
+                        </p>
+                      </div>
+                    ) : settings?.has_api_key ? (
+                      <div className="bg-green-500/5 border border-green-500/10 rounded-2xl p-6 flex items-center gap-4">
+                        <div className="w-10 h-10 bg-green-500/10 rounded-xl flex items-center justify-center">
+                          <Shield className="w-5 h-5 text-green-500" />
+                        </div>
+                        <div>
+                          <p className="text-sm font-bold">API Key is Active</p>
+                          <p className="text-xs text-white/40">Your launch routes are protected.</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="bg-white/[0.02] border border-dashed border-white/10 rounded-2xl p-6 text-center">
+                        <p className="text-sm text-white/20">No API key set. Launch routes are currently public.</p>
+                      </div>
+                    )}
+
+                    <div className="space-y-3 pt-4">
+                      <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Local API Key (For this browser)</label>
+                      <div className="flex gap-3">
+                        <input
+                          type="password"
+                          placeholder="Paste your API key here to enable UI actions"
+                          value={localApiKey}
+                          onChange={(e) => {
+                            setLocalApiKey(e.target.value);
+                            localStorage.setItem("browser_manager_api_key", e.target.value);
+                          }}
+                          className="flex-1 bg-black/40 border border-white/10 rounded-2xl px-5 py-4 focus:outline-none focus:border-orange-500 transition-all font-mono text-sm"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="space-y-6">
+                <div className="flex items-center gap-3 mb-2">
+                  <Trash2 className="w-5 h-5 text-red-500" />
+                  <h2 className="text-lg font-bold uppercase tracking-widest text-white/60">Maintenance</h2>
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <button
+                    onClick={clearAllSessions}
+                    className="bg-red-500/10 border border-red-500/20 hover:bg-red-500 text-red-500 hover:text-white p-8 rounded-[2rem] transition-all text-left group"
+                  >
+                    <X className="w-8 h-8 mb-4 group-hover:scale-110 transition-transform" />
+                    <h3 className="font-bold mb-1">Clear All Sessions</h3>
+                    <p className="text-xs opacity-60">Force stop all running browser instances immediately.</p>
+                  </button>
+
+                  <button
+                    onClick={vacuumDatabase}
+                    className="bg-white/[0.03] border border-white/10 hover:border-orange-500/50 p-8 rounded-[2rem] transition-all text-left group"
+                  >
+                    <Server className="w-8 h-8 mb-4 text-white/20 group-hover:text-orange-500 group-hover:scale-110 transition-all" />
+                    <h3 className="font-bold mb-1">Vacuum Database</h3>
+                    <p className="text-xs text-white/40">Optimize SQLite storage and reclaim unused space.</p>
+                  </button>
+
+                  <div className="bg-white/[0.03] border border-white/10 p-8 rounded-[2rem] space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="font-bold">Backup & Restore</h3>
+                      <Globe className="w-5 h-5 text-white/20" />
+                    </div>
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          id="includePasswords"
+                          checked={exportIncludePasswords}
+                          onChange={(e) => setExportIncludePasswords(e.target.checked)}
+                          className="w-4 h-4 rounded bg-black/40 border-white/10 text-orange-500 focus:ring-orange-500"
+                        />
+                        <label htmlFor="includePasswords" className="text-xs text-white/40">Include proxy passwords (Warning: stored in plain text in JSON)</label>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <button
+                          onClick={handleExportProfiles}
+                          className="bg-white/5 hover:bg-white/10 text-white py-3 rounded-xl font-bold text-xs transition-all"
+                        >
+                          Export All
+                        </button>
+                        <label className="bg-orange-500 text-black py-3 rounded-xl font-bold text-xs transition-all text-center cursor-pointer hover:bg-orange-400">
+                          Import Profiles
+                          <input
+                            type="file"
+                            accept=".json"
+                            className="hidden"
+                            onChange={handleImportProfiles}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
             </div>
           ) : filteredProfiles.length === 0 ? (
             <div className="text-center py-32 border-2 border-dashed border-white/5 rounded-3xl bg-white/[0.02]">
@@ -1171,6 +1541,64 @@ export default function App() {
                   {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin" /> : "Create Group"}
                 </button>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[100] flex items-center gap-3 px-6 py-4 rounded-2xl bg-[#1a1a1a] border border-white/10 shadow-2xl backdrop-blur-xl"
+          >
+            {toast.type === 'success' && <CheckCircle className="w-5 h-5 text-green-500" />}
+            {toast.type === 'error' && <AlertCircle className="w-5 h-5 text-red-500" />}
+            {toast.type === 'info' && <Info className="w-5 h-5 text-blue-500" />}
+            <span className="text-sm font-medium">{toast.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirmation Modal */}
+      <AnimatePresence>
+        {confirmModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setConfirmModal(null)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-sm bg-[#111] border border-white/10 rounded-[2rem] p-8 shadow-2xl text-center"
+            >
+              <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Shield className="w-8 h-8 text-white/20" />
+              </div>
+              <h3 className="text-xl font-bold mb-2">Are you sure?</h3>
+              <p className="text-sm text-white/40 mb-8">{confirmModal.message}</p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setConfirmModal(null)}
+                  className="flex-1 px-6 py-3 rounded-xl bg-white/5 hover:bg-white/10 font-bold transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmModal.onConfirm}
+                  className="flex-1 px-6 py-3 rounded-xl bg-orange-500 text-black font-bold hover:bg-orange-400 transition-all"
+                >
+                  Confirm
+                </button>
+              </div>
             </motion.div>
           </div>
         )}
