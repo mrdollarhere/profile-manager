@@ -13,6 +13,7 @@ interface Profile {
   proxyPassword: string | null;
   fingerprint: string | null;
   createdAt: string;
+  wsEndpoint?: string;
 }
 
 export default function App() {
@@ -21,6 +22,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [launchingId, setLaunchingId] = useState<number | null>(null);
+  const [stoppingId, setStoppingId] = useState<number | null>(null);
 
   const [formData, setFormData] = useState({
     name: "",
@@ -94,13 +96,40 @@ export default function App() {
     }
   };
 
-  const handleLaunch = (id: number) => {
+  const handleLaunch = async (id: number) => {
     setLaunchingId(id);
-    // Mock launch action
-    setTimeout(() => {
+    try {
+      const res = await fetch(`/api/profiles/${id}/launch`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setProfiles(profiles.map(p => p.id === id ? { ...p, wsEndpoint: data.wsEndpoint } : p));
+      } else {
+        alert(data.error || "Failed to launch browser");
+      }
+    } catch (error) {
+      console.error("Failed to launch profile:", error);
+      alert("Failed to launch browser. Check server logs.");
+    } finally {
       setLaunchingId(null);
-      alert("Profile launched successfully! (Mock action: In a real environment, this would start a browser instance with the configured proxy settings.)");
-    }, 1500);
+    }
+  };
+
+  const handleStop = async (id: number) => {
+    setStoppingId(id);
+    try {
+      const res = await fetch(`/api/profiles/${id}/stop`, { method: "POST" });
+      if (res.ok) {
+        setProfiles(profiles.map(p => p.id === id ? { ...p, wsEndpoint: undefined } : p));
+      } else {
+        const data = await res.json();
+        alert(data.error || "Failed to stop browser");
+      }
+    } catch (error) {
+      console.error("Failed to stop profile:", error);
+      alert("Failed to stop browser.");
+    } finally {
+      setStoppingId(null);
+    }
   };
 
   return (
@@ -199,25 +228,53 @@ export default function App() {
                         <span>Fingerprint Active</span>
                       </div>
                     )}
+                    {profile.wsEndpoint && (
+                      <div className="flex flex-col gap-1 px-3 py-2 bg-orange-500/5 rounded-xl border border-orange-500/10">
+                        <div className="flex items-center gap-2 text-[10px] text-orange-500 font-bold uppercase tracking-wider">
+                          <div className="w-1.5 h-1.5 bg-orange-500 rounded-full animate-pulse" />
+                          Active Session
+                        </div>
+                        <p className="text-[10px] text-white/40 font-mono truncate">{profile.wsEndpoint}</p>
+                      </div>
+                    )}
                   </div>
 
-                  <button
-                    onClick={() => handleLaunch(profile.id)}
-                    disabled={launchingId === profile.id}
-                    className="w-full flex items-center justify-center gap-2 bg-white/5 hover:bg-orange-500 text-white hover:text-black py-4 rounded-2xl font-bold transition-all disabled:opacity-50"
-                  >
-                    {launchingId === profile.id ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Launching...
-                      </>
+                  <div className="flex gap-2">
+                    {profile.wsEndpoint ? (
+                      <button
+                        onClick={() => handleStop(profile.id)}
+                        disabled={stoppingId === profile.id}
+                        className="flex-1 flex items-center justify-center gap-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white py-4 rounded-2xl font-bold transition-all disabled:opacity-50"
+                      >
+                        {stoppingId === profile.id ? (
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                        ) : (
+                          <>
+                            <X className="w-5 h-5" />
+                            Stop Session
+                          </>
+                        )}
+                      </button>
                     ) : (
-                      <>
-                        <Rocket className="w-5 h-5" />
-                        Launch Browser
-                      </>
+                      <button
+                        onClick={() => handleLaunch(profile.id)}
+                        disabled={launchingId === profile.id}
+                        className="flex-1 flex items-center justify-center gap-2 bg-white/5 hover:bg-orange-500 text-white hover:text-black py-4 rounded-2xl font-bold transition-all disabled:opacity-50"
+                      >
+                        {launchingId === profile.id ? (
+                          <>
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                            Launching...
+                          </>
+                        ) : (
+                          <>
+                            <Rocket className="w-5 h-5" />
+                            Launch Browser
+                          </>
+                        )}
+                      </button>
                     )}
-                  </button>
+                  </div>
                 </motion.div>
               ))}
             </AnimatePresence>
